@@ -35,9 +35,9 @@ os.environ["MAX_LOADED_MODELS"] = "1"  # Keep memory footprint lean on Kaggle GP
 # Open log file to capture server stdout/stderr
 server_log = open("server.log", "w")
 
-# Start server as a background subprocess
+# Start server as a background subprocess using run.py (automatically configures src path)
 server_process = subprocess.Popen(
-    ["python3", "-m", "uvicorn", "huggingface_openai_api.app:app", "--host", "127.0.0.1", "--port", "8000"],
+    ["python3", "run.py"],
     stdout=server_log,
     stderr=subprocess.STDOUT,
     preexec_fn=os.setsid,  # Clean process group management

@@ -147,9 +147,9 @@ os.environ["MAX_LOADED_MODELS"] = "1"  # Preserve Kaggle GPU VRAM
 # 2. Redirect output to a log file
 log_file = open("server.log", "w")
 
-# 3. Launch FastAPI server via background subprocess
+# 3. Launch FastAPI server via background subprocess using run.py (handles sys.path automatically)
 server_process = subprocess.Popen(
-    ["python3", "-m", "uvicorn", "huggingface_openai_api.app:app", "--host", "127.0.0.1", "--port", "8000"],
+    ["python3", "run.py"],
     stdout=log_file,
     stderr=subprocess.STDOUT,
     preexec_fn=os.setsid,  # Detach process group for clean lifecycle management
