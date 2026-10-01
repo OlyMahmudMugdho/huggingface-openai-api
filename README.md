@@ -1,102 +1,269 @@
 # Hugging Face OpenAI-Compatible API Server
 
-A lightweight, high-performance FastAPI server that exposes Hugging Face models through the standard OpenAI API format (`/v1/models`, `/v1/chat/completions`, and `/v1/completions`).
+A production-ready, high-performance FastAPI server that wraps Hugging Face language models and exposes them through standard OpenAI-compatible REST endpoints (`/v1/models`, `/v1/chat/completions`, and `/v1/completions`).
 
-## Key Features
-
-- **OpenAI Compatible**: Seamlessly works with the official `openai` Python/Node SDKs, OpenWebUI, LibreChat, and standard HTTP clients.
-- **External Model Auto-Discovery**:
-  - Automatically scans and lists models downloaded via Hugging Face Hub (`huggingface-cli download`, `snapshot_download`, etc.) from `~/.cache/huggingface/hub` or `$HF_HUB_CACHE`.
-  - Automatically discovers local models placed in `./models/` or paths configured via `LOCAL_MODELS_DIR` / `MODELS_DIR`.
-  - **Dynamic Rescanning**: Models downloaded externally while the server is running immediately appear in `GET /v1/models` without server restarts.
-- **Streaming Support**: Full Server-Sent Events (SSE) streaming support for `/v1/chat/completions` and `/v1/completions`.
-- **Chat Template Support**: Automatically utilizes the model's tokenizer chat template (with fallback formatting if absent).
-- **Resource Management**: Device auto-detection (`cuda`, `mps`, `cpu`), automatic float16/bfloat16 precision, and LRU model memory management to avoid Out-Of-Memory (OOM).
+Whether models are cached via `huggingface-cli`, saved in a local folder, or mounted via Kaggle Datasets (`/kaggle/input`), this server automatically discovers and serves them without requiring manual configuration or server restarts.
 
 ---
 
-## Installation & Setup
+## Table of Contents
 
-This project is managed with [uv](https://github.com/astral-sh/uv).
+- [Overview & Architecture](#overview--architecture)
+- [Key Features](#key-features)
+- [Local Quickstart](#local-quickstart)
+- [External Model Auto-Discovery](#external-model-auto-discovery)
+- [Running in Kaggle Notebooks (Background Subprocess)](#running-in-kaggle-notebooks-background-subprocess)
+- [API Reference & Usage](#api-reference--usage)
+- [Configuration Reference](#configuration-reference)
+- [Running Tests](#running-tests)
+
+---
+
+## Overview & Architecture
+
+Many modern AI frontends and development frameworks (such as LibreChat, OpenWebUI, LangChain, LlamaIndex, and the official OpenAI SDK) expect an OpenAI-formatted API. This service acts as an abstraction layer over `transformers` and `torch`, providing:
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Client (OpenAI SDK / OpenWebUI / Curl / LangChain)     │
+└───────────────────────────┬────────────────────────────┘
+                            │ HTTP (OpenAI API Format)
+┌───────────────────────────▼────────────────────────────┐
+│                  FastAPI Application                   │
+│  - /v1/models             - /v1/chat/completions       │
+│  - /v1/models/{model_id}  - /v1/completions (SSE)      │
+└─────────────┬────────────────────────────┬─────────────┘
+              │                            │
+┌─────────────▼──────────────┐ ┌───────────▼─────────────┐
+│    Dynamic Model Registry  │ │     Inference Engine    │
+│  - HF Cache (~/.cache/hub) │ │  - Hugging Face Models  │
+│  - Local Dirs (./models)   │ │  - Chat Template Engine │
+│  - Kaggle (/kaggle/input)  │ │  - Streaming (SSE)      │
+│  - Real-time rescanning    │ │  - LRU Memory Eviction  │
+└────────────────────────────┘ └─────────────────────────┘
+```
+
+---
+
+## Key Features
+
+- **100% OpenAI API Compatibility**: Drop-in replacement for OpenAI API endpoints supporting streaming (SSE) and standard JSON responses.
+- **Dynamic Hot-Discovery**:
+  - Automatically identifies models downloaded to the Hugging Face Hub cache (`~/.cache/huggingface/hub`).
+  - Scans local directories (`./models` or paths set in `LOCAL_MODELS_DIR`).
+  - **Live Rescanning**: External downloads while the server is active immediately appear in `GET /v1/models` without restarting.
+- **Memory & Resource Management**:
+  - Auto-selects accelerator (`cuda`, `mps`, or `cpu`) and optimal precision (`bfloat16` / `float16`).
+  - Configurable LRU model caching (`MAX_LOADED_MODELS`) to automatically evict idle models and avoid Out-Of-Memory (OOM) errors.
+- **Chat Template Engine**: Automatically applies the model tokenizer's native Jinja chat template, with a clean fallback for raw base models.
+- **Kaggle & Colab Friendly**: Seamless background execution via Python `subprocess` with health monitoring and log redirection.
+
+---
+
+## Local Quickstart
+
+### 1. Prerequisites & Installation
+
+The project uses [uv](https://github.com/astral-sh/uv) for fast, deterministic dependency management:
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone https://github.com/your-username/huggingface-openai-api.git
 cd huggingface-openai-api
 
 # Install dependencies (FastAPI, PyTorch, Transformers, Accelerate)
 uv sync
 ```
 
----
+### 2. Start the Server
 
-## Running the Server
-
-Start the API server using uv:
-
+Using the packaged CLI entrypoint:
 ```bash
 uv run huggingface-openai-api
 ```
 
-Or run via uvicorn directly:
-
+Or using Uvicorn directly:
 ```bash
 uv run uvicorn huggingface_openai_api.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ---
 
-## How External Model Discovery Works
+## External Model Auto-Discovery
 
-You can download models externally using either of the following approaches:
+You do not need to register models manually. Any model downloaded externally via either of the following mechanisms is immediately discovered:
 
-### Method 1: Using Hugging Face CLI or Cache
-If you download a model using `huggingface-cli` or `snapshot_download`:
+### 1. Hugging Face CLI or `snapshot_download`
+When you download a model with `huggingface-cli`:
 ```bash
 huggingface-cli download Qwen/Qwen2.5-0.5B-Instruct
 ```
-The model files are saved to `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct`. The server dynamically inspects this directory:
-- It appears in `GET /v1/models` as `Qwen/Qwen2.5-0.5B-Instruct`.
-- You can query it in `/v1/chat/completions` using `"model": "Qwen/Qwen2.5-0.5B-Instruct"` or `"Qwen2.5-0.5B-Instruct"`.
+The files land in `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct`. The server scans this cache directory and exposes it under its repo name `Qwen/Qwen2.5-0.5B-Instruct`.
 
-### Method 2: Local Directory (`./models` or `LOCAL_MODELS_DIR`)
-Download or save model weights (containing `config.json` and weight files) into `./models/`:
-```bash
-mkdir -p models/my-custom-llm
-# Place config.json, tokenizer.json, model.safetensors into models/my-custom-llm/
+### 2. Local Custom Directory (`./models` or `$LOCAL_MODELS_DIR`)
+Place model files (must contain `config.json` or model weights) in `./models/`:
+```text
+models/
+└── my-custom-model/
+    ├── config.json
+    ├── tokenizer.json
+    └── model.safetensors
 ```
-Or point to any custom directory on your system:
+Or export custom directories:
 ```bash
-export LOCAL_MODELS_DIR="/path/to/my/models:/another/path/to/models"
+export LOCAL_MODELS_DIR="/mnt/storage/models:/kaggle/input"
 ```
-The server immediately detects any subdirectories containing valid model files and lists them in `GET /v1/models`.
+The model will be registered under `my-custom-model` and immediately served.
 
 ---
 
-## Configuration (Environment Variables)
+## Running in Kaggle Notebooks (Background Subprocess)
 
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Bind host |
-| `PORT` | `8000` | Bind port |
-| `OPENAI_API_KEY` | *(None)* | Optional API key to secure endpoints with Bearer auth |
-| `HF_HOME` | `~/.cache/huggingface` | Hugging Face home directory |
-| `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | Hugging Face Hub cache directory |
-| `LOCAL_MODELS_DIR` | `./models` | Colon- or comma-separated list of local model folders |
-| `DEVICE` | `auto` | Device to run inference on (`auto`, `cuda`, `mps`, `cpu`) |
-| `TORCH_DTYPE` | `auto` | Torch data type (`auto`, `float16`, `bfloat16`, `float32`) |
-| `MAX_LOADED_MODELS` | `1` | Maximum number of models kept concurrently in memory |
-| `DEFAULT_MAX_NEW_TOKENS` | `512` | Default max generation tokens if unspecified |
+Kaggle notebooks run cell-by-cell in a single interactive session. To run the FastAPI server concurrently in the background while interacting with it from other notebook cells, launch it using Python's `subprocess.Popen`.
+
+### Kaggle Notebook Implementation
+
+#### Step 1: Install Dependencies
+```python
+# In a Kaggle Notebook Cell:
+!pip install -q fastapi "uvicorn[standard]" transformers torch accelerate huggingface-hub
+```
+
+#### Step 2: Launch Server in Background
+Run this cell to clone/load the server, configure search paths (including Kaggle's `/kaggle/input` datasets), and spawn the background process:
+
+```python
+import os
+import subprocess
+import time
+import requests
+
+# 1. Configure paths: auto-discover models in Kaggle input and HF cache
+os.environ["LOCAL_MODELS_DIR"] = "/kaggle/input:./models"
+os.environ["HOST"] = "127.0.0.1"
+os.environ["PORT"] = "8000"
+os.environ["MAX_LOADED_MODELS"] = "1"  # Preserve Kaggle GPU VRAM
+
+# 2. Redirect output to a log file
+log_file = open("server.log", "w")
+
+# 3. Launch FastAPI server via background subprocess
+server_process = subprocess.Popen(
+    ["python3", "-m", "uvicorn", "huggingface_openai_api.app:app", "--host", "127.0.0.1", "--port", "8000"],
+    stdout=log_file,
+    stderr=subprocess.STDOUT,
+    preexec_fn=os.setsid,  # Detach process group for clean lifecycle management
+)
+
+print(f"Server launched with PID: {server_process.pid}")
+
+# 4. Wait for server to become healthy
+healthy = False
+for i in range(30):
+    try:
+        res = requests.get("http://127.0.0.1:8000/health", timeout=1)
+        if res.status_code == 200:
+            healthy = True
+            print("Server is healthy and ready to accept requests!")
+            break
+    except Exception:
+        time.sleep(1)
+
+if not healthy:
+    print("Server failed to start. Last log lines:")
+    with open("server.log", "r") as f:
+        print(f.read())
+```
+
+#### Step 3: Inspect Logs Anytime
+```python
+# View recent server logs
+with open("server.log", "r") as f:
+    lines = f.readlines()
+    print("".join(lines[-25:]))
+```
+
+#### Step 4: Interact via Official OpenAI Python Client
+```python
+!pip install -q openai
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="none",  # Not required unless OPENAI_API_KEY is set
+)
+
+# 1. List all available models (shows models in /kaggle/input and HF cache)
+models = client.models.list()
+print("Available Models:")
+for m in models.data:
+    print(f" - ID: {m.id} (Owner: {m.owned_by})")
+
+# 2. Perform streaming chat completion
+if models.data:
+    selected_model = models.data[0].id
+    print(f"\nGenerating response from: {selected_model}...")
+
+    stream = client.chat.completions.create(
+        model=selected_model,
+        messages=[
+            {"role": "system", "content": "You are a concise expert AI assistant."},
+            {"role": "user", "content": "Explain gradient descent in two sentences."},
+        ],
+        stream=True,
+    )
+
+    for chunk in stream:
+        content = chunk.choices[0].delta.content or ""
+        print(content, end="", flush=True)
+    print()
+```
+
+#### Step 5: (Optional) Expose Outside Kaggle via Cloudflared Tunnel
+To connect external tools (e.g., OpenWebUI or local scripts) to your Kaggle instance:
+```python
+# Download and start a Cloudflare tunnel
+!wget -q -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+!dpkg -i cloudflared-linux-amd64.deb > /dev/null 2>&1
+
+tunnel_proc = subprocess.Popen(
+    ["cloudflared", "tunnel", "--url", "http://127.0.0.1:8000"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+
+# Wait for public URL
+import re
+for line in tunnel_proc.stdout:
+    match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+    if match:
+        print(f"Public OpenAI Base URL: {match.group(0)}/v1")
+        break
+```
+
+#### Step 6: Graceful Shutdown
+When finishing your session, terminate the server background process:
+```python
+import signal
+
+if server_process and server_process.poll() is None:
+    os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
+    server_process.wait()
+    print("Server stopped cleanly.")
+```
 
 ---
 
-## Usage Examples
+## API Reference & Usage
 
-### 1. List Available Models
+### 1. List Available Models (`GET /v1/models`)
+
 ```bash
 curl http://localhost:8000/v1/models
 ```
-Response:
+
+**Response**:
 ```json
 {
   "object": "list",
@@ -106,74 +273,81 @@ Response:
       "object": "model",
       "created": 1727769600,
       "owned_by": "huggingface",
-      "location": "/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/..."
+      "location": "/home/codespace/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/...",
+      "permission": [...]
     }
   ]
 }
 ```
 
-### 2. Chat Completions (Non-Streaming)
+### 2. Chat Completions (`POST /v1/chat/completions`)
+
+#### Non-Streaming:
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-0.5B-Instruct",
     "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Explain recursion in one sentence."}
+      {"role": "system", "content": "You are a helpful coding assistant."},
+      {"role": "user", "content": "Write a python function to compute factorial."}
     ],
     "temperature": 0.7,
-    "max_tokens": 100
+    "max_tokens": 150
   }'
 ```
 
-### 3. Chat Completions (Streaming)
+#### Streaming (Server-Sent Events):
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-0.5B-Instruct",
     "messages": [
-      {"role": "user", "content": "Write a short poem about coding."}
+      {"role": "user", "content": "Tell me an interesting science fact."}
     ],
     "stream": true
   }'
 ```
 
-### 4. Using the Official OpenAI Python SDK
-```python
-from openai import OpenAI
+### 3. Text Completions (`POST /v1/completions`)
 
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="none",  # not needed unless OPENAI_API_KEY is configured
-)
-
-# List models
-models = client.models.list()
-for model in models:
-    print(f"Discovered model: {model.id}")
-
-# Chat completion
-response = client.chat.completions.create(
-    model=models.data[0].id,
-    messages=[
-        {"role": "user", "content": "What is FastAPI?"}
-    ],
-    stream=True,
-)
-
-for chunk in response:
-    content = chunk.choices[0].delta.content or ""
-    print(content, end="", flush=True)
-print()
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "prompt": "The future of artificial intelligence is",
+    "max_tokens": 50,
+    "temperature": 0.8
+  }'
 ```
+
+---
+
+## Configuration Reference
+
+Configure the server via environment variables or a `.env` file:
+
+| Environment Variable | Default Value | Description |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Host IP address to bind the server to |
+| `PORT` | `8000` | Port to listen on |
+| `OPENAI_API_KEY` | *(None)* | Optional API key. When set, requests must pass `Authorization: Bearer <key>` |
+| `HF_HOME` | `~/.cache/huggingface` | Hugging Face cache root directory |
+| `HF_HUB_CACHE` | `~/.cache/huggingface/hub` | Hugging Face Hub snapshot cache directory |
+| `LOCAL_MODELS_DIR` | `./models` | Colon- or comma-separated list of directories to scan for local models |
+| `DEVICE` | `auto` | Target device (`auto`, `cuda`, `mps`, `cpu`) |
+| `TORCH_DTYPE` | `auto` | Floating point format (`auto`, `float16`, `bfloat16`, `float32`) |
+| `MAX_LOADED_MODELS` | `1` | Max models kept loaded in memory before LRU eviction |
+| `DEFAULT_MAX_NEW_TOKENS` | `512` | Default token generation limit if unspecified in client request |
+| `TRUST_REMOTE_CODE` | `false` | Allow execution of custom code in model repositories (`true` / `false`) |
 
 ---
 
 ## Running Tests
 
-Tests verify the registry and API endpoints using mock and directory scanning without needing to download large model weights:
+Unit tests verify endpoint formatting, dynamic directory scanning, and streaming mechanics using mocked configurations—**without requiring heavy model weight downloads**:
 
 ```bash
 uv run pytest
